@@ -1,0 +1,132 @@
+// Data manupulation code
+
+import csv
+
+mycsv = csv.reader(open('./combined.csv'))
+writer=csv.writer(open('./ratings.csv','wb'))
+writer.writerow(['UserID','JokeID','Rating'])
+for row in mycsv:
+    user=row[0]
+    count=1
+    for rating in row[1:]:
+        list=[]
+        list.append(user)#userID
+        list.append(count)#jokeID
+        list.append(rating)
+        writer.writerow(list)
+        count+=1
+
+// pyspark code
+
+from pyspark.mllib.recommendation import ALS
+from pyspark.mllib.evaluation import RegressionMetrics
+
+
+#PreProcessing the data
+#raw_data_1 = sc.textFile("/FileStore/tables/g235hl4r1479696958391/ratings.csv")
+
+raw_data_1 = sc.textFile("/FileStore/tables/ods06qe21479752955375/ratings.csv")
+header = raw_data_1.take(1)[0]
+ratings_data = raw_data_1.filter(lambda l: l!=header).map(lambda l: l.split(",")).map(lambda s: (int(s[0]),int(s[1]),float(s[2]))).filter(lambda s : s[2]!=99).map(lambda s: (s[0],s[1],s[2]/10)).cache()
+
+#splitting the dataset to test and train
+#train1,test1 = ratings_data.randomSplit([0.9,0.1])
+train,test=ratings_data.randomSplit([0.8,0.2])
+test_predict=test.map(lambda s:(s[0],s[1]))
+test=test.map(lambda s:((s[0], s[1]), s[2]))
+
+
+# Building the model
+l_array= [0.001,0.005,0.05,0.5]
+r_array = [2,4,6,8,12,18]
+
+#l_array=[0.001]
+#r_array=[2]
+min_rmse = float('inf')
+
+for l in l_array:
+    for r in r_array:
+        model = ALS.train(train, rank=r,iterations=10,lambda_=l, blocks=10,nonnegative=True,seed=None)
+        predict_obs = model.predictAll(test_predict).map(lambda s: ((s[0], s[1]), s[2])).join(test).map(lambda (k,(v1,v2)):(v1,v2))
+        #print(predict_obs.take(1000))
+        metrics = RegressionMetrics(predict_obs)
+        abs_error=metrics.meanAbsoluteError
+        rmse=metrics.rootMeanSquaredError
+        variance=metrics.explainedVariance
+        sq_error=metrics.meanSquaredError
+        print 'Model with rank=%s and lambda=%s has rmse=%s; abs_error=%s; variance=%s; squared_error=%s ' % (r,l,rmse,abs_error,variance,sq_error)
+        if rmse < min_rmse:
+            min_rmse = rmse
+            best_rank = r
+            best_l =l
+            best_metrics=metrics
+            best_model=model
+
+print(min_rmse)            
+abs_error=best_metrics.meanAbsoluteError
+rmse=best_metrics.rootMeanSquaredError
+variance=best_metrics.explainedVariance
+sq_error=best_metrics.meanSquaredError
+        
+print 'The best model was trained with rank %s and lambda=%s' % (best_rank,best_l)
+print 'This model has metrics as follows'
+print 'root mean square error=%s' % rmse
+print 'mean absolute error=%s' % abs_error
+print 'variance=%s' % variance
+print ''
+
+#recommends top 5 jokes(by joke id) for each user id
+recommended_products=model.recommendProductsForUsers(5).map(lambda l:(l[0],(l[1][0][1],l[1][1][1],l[1][2][1],l[1][3][1],l[1][4][1])))
+#displaying only first 100 results
+print 'displaying 100 results of 5 jokes recommended for each user id'
+print recommended_products.take(100)
+
+
+print ''
+
+#recommends top 5 users who are mostly likely going to like the joke for all the jokes
+recommeded_users=model.recommendUsersForProducts(5).map(lambda l:(l[0],(l[1][0][0],l[1][1][0],l[1][2][0],l[1][3][0],l[1][4][0])))
+#displaying only first 100 results
+print 'displaying 100 results of 5 users recommended for each joke id'
+print recommeded_users.take(100)
+
+
+
+// neo4j code
+
+// Step 1
+USING PERIODIC COMMIT 1000
+LOAD CSV WITH HEADERS FROM "file:///ratings.csv" AS line WITH line
+LIMIT 10000
+WHERE line.Rating <> "99"
+MERGE (m:User {userId:line.UserID})
+MERGE (j:Joke{jokeId:line.JokeID})
+CREATE (m)-[r:RATED {Rating:line.Rating}]->(j)
+RETURN m,r,j;
+
+// Step 2
+MATCH (user1:User{userId : '1'})-[r1:RATED]-> (j:Joke)<-[r2:RATED]-(user2:User)
+WITH user1.userId AS user1Id, user2.userId AS user2Id, user1, user2,count(j) AS commonJokes,
+
+// Step 3
+collect((toInt(r1.Rating)-toInt(r2.Rating))^2) AS ratings,collect(j.jokeId) AS JokeIDs
+WITH commonJokes, JokeIDs, user1, user2, ratings
+MERGE (user1)-[s:Similarity]->(user2) SET s.similarity = 1-(SQRT(reduce(sum=0.0, k in extract(r in ratings | r/commonJokes) | sum+k))/20);
+
+// Step 4
+MATCH (user1:User)-[r:RATED]->(j:Joke),(user1)<-[s:Similarity]-(user2:User {userId:'1'})
+WHERE NOT ((user2)-[:RATED]->(j))
+WITH j, r.Rating AS rating,s.similarity as similarity
+WHERE similarity > 0.6
+
+// Step 5
+WITH j, COLLECT(rating) AS ratingCollection, COLLECT(similarity) AS similarityCollection
+
+// Step 6
+WITH REDUCE(num = 0, s IN similarityCollection | toInt(num)+toInt(s))*1.0 / LENGTH(similarityCollection) AS avgSimilarity,
+j,similarityCollection, REDUCE(num = 0, s IN ratingCollection | toInt(num)+toInt(s))*1.0 / LENGTH(similarityCollection) AS avgRating, ratingCollection
+
+// Step 7
+ORDER BY LENGTH(ratingCollection) DESC, avgRating DESC, avgSimilarity DESC
+WHERE avgRating >2
+RETURN j AS Joke, avgRating AS Recommendation
